@@ -1,5 +1,5 @@
 #pragma once
-#define FIRMWARE_VERSION "v2.3"
+#define FIRMWARE_VERSION "v2.4"
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -30,6 +30,24 @@ extern bool gpsHasFix;
 extern bool allowScanForOled;
 extern bool userScanOverride;
 extern bool autoPaused;
+
+// ---- GPS time-source tracking ----
+// Source of the timestamp embedded in the most recent CSV row.
+//   0 = GPS    — fresh GPS date+time (within cfg.gpsFixAgeMaxMs)
+//   1 = SYSTEM — system clock (previously disciplined from GPS)
+//   2 = PLACEHOLDER — neither available; fallback "1970-01-01 00:MM:SS"
+extern uint8_t  gpsTimeSource;
+extern uint32_t gpsTimeFallbackCount;  // rows that fell back off GPS (sources 1+2)
+
+// ---- SD space accounting ----
+extern uint64_t sdFreeBytes;
+extern uint64_t sdTotalBytes;
+extern bool     sdLowSpace;     // < SD_LOW_SPACE_BYTES free
+extern bool     sdCritical;     // < SD_CRITICAL_BYTES free  -> stop logging
+// Thresholds (raise/lower if needed; chosen to leave room for at least
+// a few minutes of further logging once "LOW" trips on a typical card).
+static const uint64_t SD_LOW_SPACE_BYTES = 50ULL * 1024ULL * 1024ULL;  // 50 MB
+static const uint64_t SD_CRITICAL_BYTES  =  5ULL * 1024ULL * 1024ULL;  //  5 MB
 
 // ---- OLED page system ----
 // 0=Status, 1=Networks, 2=Navigation, 3=Pause, 4=Pig, 5=MeshNode

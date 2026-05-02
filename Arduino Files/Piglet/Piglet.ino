@@ -45,21 +45,34 @@ static const uint32_t LONG_PRESS_MS = 2000;
 static void enterDeepSleep() {
   Serial.println("[SLEEP] Long press detected – entering deep sleep...");
 
-  // Flush & close the active CSV log
-  closeLogFile();
+  // Flush & close the active CSV log. closeLogFile() now stats the file
+  // back from the card so we can warn the user if the last buffer didn't
+  // actually land (stuck card, FS error, yanked SD, etc.).
+  bool flushOk = closeLogFile();
 
   // Disconnect WiFi cleanly
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
 
-  // Show message on OLED
+  // Show message on OLED. If the close-verify failed, flag it briefly
+  // so the user has a chance to spot it before the screen goes dark.
   display.clearDisplay();
   display.setTextSize(2);
   display.setTextColor(SSD1306_WHITE);
-  display.setCursor(16, 24);
-  display.print("Sleep...");
+  if (flushOk) {
+    display.setCursor(16, 24);
+    display.print("Sleep...");
+  } else {
+    display.setCursor(4, 8);
+    display.print("SD WARN");
+    display.setTextSize(1);
+    display.setCursor(0, 36);
+    display.print("Last write may not");
+    display.setCursor(0, 48);
+    display.print("have saved.");
+  }
   display.display();
-  delay(600);
+  delay(flushOk ? 600 : 2000);
 
   // Configure wake source (button press = LOW on INPUT_PULLUP)
   #if defined(CONFIG_IDF_TARGET_ESP32S3)
@@ -368,6 +381,17 @@ void setup() {
   GPSSerial.begin(cfg.gpsBaud, SERIAL_8N1, pins.gps_rx, pins.gps_tx);
   Serial.println("[GPS] UART started");
 
+  // If autodetect is on and the configured baud isn't producing NMEA, try
+  // common rates. The detected baud overrides cfg.gpsBaud for this session
+  // only — we don't write it back to /wardriver.cfg automatically.
+  if (cfg.gpsAutodetect) {
+    uint32_t detected = gpsAutodetectBaud(cfg.gpsBaud, pins.gps_rx, pins.gps_tx);
+    if (detected != cfg.gpsBaud) {
+      Serial.printf("[GPS] Using detected baud %lu (cfg.gpsBaud=%lu unchanged on disk)\n",
+                    (unsigned long)detected, (unsigned long)cfg.gpsBaud);
+    }
+  }
+
   // Try STA FIRST (short timeout). Do NOT start AP unless STA fails.
   WiFi.mode(WIFI_STA);
   bool staOk = connectSTA(12000);
@@ -437,6 +461,10 @@ void setup() {
     Serial.println(WiFi.softAPIP());
     Serial.println("[WEB] AP UI: http://192.168.4.1/");
   }
+
+  // Prime SD space info so the first OLED frame shows accurate state
+  // (later refreshed periodically from inside appendWigleRow).
+  if (sdOk) updateSdSpaceInfo();
 
   // Purge any header-only CSVs left over from previous sessions
   if (sdOk) {

@@ -40,7 +40,7 @@
 #include "esp_wifi.h"
 
 // Firmware version
-#define FIRMWARE_VERSION "v2.3"
+#define FIRMWARE_VERSION "v2.4"
 
 // ---------------- Pins (T-DONGLE C5) ----------------
 struct PinMap {
@@ -127,6 +127,13 @@ struct Config {
   String wardriverSsid = "Piglet-WARDRIVE";
   String wardriverPsk  = "wardrive1234";
   uint32_t gpsBaud     = 9600;
+  // Try common NMEA bauds at boot if the configured baud isn't producing
+  // valid sentences. Detected baud overrides cfg.gpsBaud for the session
+  // only — not persisted, so /wardriver.cfg stays as the user set it.
+  bool     gpsAutodetect = true;
+  // Max age (ms) of GPS date+time before iso8601NowUTC() falls back to system
+  // clock. T-Dongle defaults tighter (5s) since this board is usually static.
+  uint32_t gpsFixAgeMaxMs = 5000;
   String scanMode      = "aggressive";
   String speedUnits    = "kmh";
   // WDGoWars API key from https://wdgwars.pl/profile
@@ -146,6 +153,21 @@ static const char* bootSlogan = nullptr;
 static bool sdOk = false;
 static bool scanningEnabled = true;
 static bool gpsHasFix = false;
+
+// ---- GPS time-source tracking ----
+// 0 = GPS (fresh), 1 = SYSTEM (drift possible), 2 = PLACEHOLDER (1970)
+static uint8_t  gpsTimeSource         = 2;
+static uint32_t gpsTimeFallbackCount  = 0;
+
+// ---- SD space accounting ----
+// Re-checked periodically inside appendWigleRow. Surfaced on the OLED/TFT
+// so the user sees "LOW" before the card actually runs out of clusters.
+static uint64_t sdFreeBytes  = 0;
+static uint64_t sdTotalBytes = 0;
+static bool     sdLowSpace   = false;
+static bool     sdCritical   = false;
+static const uint64_t SD_LOW_SPACE_BYTES = 50ULL * 1024ULL * 1024ULL;  // 50 MB
+static const uint64_t SD_CRITICAL_BYTES  =  5ULL * 1024ULL * 1024ULL;  //  5 MB
 
 // UI state
 static int   uiGpsSats    = 0;
@@ -321,20 +343,101 @@ static time_t makeUtcEpochFromTm(struct tm* t) {
   return epoch;
 }
 
+// Logs the time-source on transition only, so a long drive doesn't spam
+// the serial console; a boot with no fix produces a single visible line.
+static void noteTimeSource(uint8_t newSource) {
+  if (newSource != 0) gpsTimeFallbackCount++;
+  if (newSource == gpsTimeSource) return;
+  gpsTimeSource = newSource;
+  const char* name = (newSource == 0) ? "GPS"
+                   : (newSource == 1) ? "SYSTEM (no fresh GPS time — drift possible)"
+                   :                    "PLACEHOLDER (no GPS, no system clock — rows will read 1970)";
+  Serial.printf("[TIME] source -> %s\n", name);
+}
+
 static String iso8601NowUTC() {
+  uint32_t maxAge = cfg.gpsFixAgeMaxMs;
+  if (maxAge < 1000) maxAge = 1000;
+
+  // 1) Fresh GPS time
   if (gps.date.isValid() && gps.time.isValid() &&
-      gps.date.age() < 5000 && gps.time.age() < 5000) {
+      gps.date.age() < maxAge && gps.time.age() < maxAge) {
+    noteTimeSource(0);
     char buf[32];
     snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
              gps.date.year(), gps.date.month(), gps.date.day(),
              gps.time.hour(), gps.time.minute(), gps.time.second());
     return String(buf);
   }
+
+  // 2) System time if it looks sane (~2023+)
+  time_t now = time(nullptr);
+  if (now > 1700000000) {
+    noteTimeSource(1);
+    struct tm tmUtc;
+    gmtime_r(&now, &tmUtc);
+    char buf[32];
+    strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tmUtc);
+    return String(buf);
+  }
+
+  // 3) Placeholder
+  noteTimeSource(2);
   uint32_t s = millis() / 1000;
   char buf[32];
   snprintf(buf, sizeof(buf), "1970-01-01T00:%02lu:%02luZ",
            (unsigned long)((s/60)%60), (unsigned long)(s%60));
   return String(buf);
+}
+
+// ---- GPS baud autodetect ----
+// Two `$` chars in a 1.5 s window means the configured baud is producing
+// real NMEA. A baud mismatch yields garbage (no `$` characters).
+static bool gpsBaudWorks(uint32_t baud, int rxPin, int txPin, uint32_t timeoutMs) {
+  GPSSerial.end();
+  GPSSerial.setRxBufferSize(512);
+  GPSSerial.begin(baud, SERIAL_8N1, rxPin, txPin);
+  uint32_t t0 = millis();
+  int dollars = 0;
+  while ((millis() - t0) < timeoutMs) {
+    while (GPSSerial.available()) {
+      char c = GPSSerial.read();
+      if (c == '$') dollars++;
+      if (dollars >= 2) return true;
+    }
+    delay(2);
+  }
+  return false;
+}
+
+static uint32_t gpsAutodetectBaud(uint32_t preferred, int rxPin, int txPin) {
+  static const uint32_t CANDIDATES[] = { 9600, 38400, 115200, 4800, 19200, 57600 };
+  static const size_t N = sizeof(CANDIDATES) / sizeof(CANDIDATES[0]);
+
+  Serial.printf("[GPS] Autodetect: trying preferred %lu first...\n",
+                (unsigned long)preferred);
+  if (gpsBaudWorks(preferred, rxPin, txPin, 1500)) {
+    Serial.printf("[GPS] Autodetect: %lu OK\n", (unsigned long)preferred);
+    return preferred;
+  }
+
+  for (size_t i = 0; i < N; i++) {
+    uint32_t b = CANDIDATES[i];
+    if (b == preferred) continue;
+    Serial.printf("[GPS] Autodetect: trying %lu...\n", (unsigned long)b);
+    if (gpsBaudWorks(b, rxPin, txPin, 1200)) {
+      Serial.printf("[GPS] Autodetect: %lu OK (overrides cfg %lu for this session)\n",
+                    (unsigned long)b, (unsigned long)preferred);
+      return b;
+    }
+  }
+
+  Serial.printf("[GPS] Autodetect: no baud responded — staying on %lu (GPS may be off)\n",
+                (unsigned long)preferred);
+  GPSSerial.end();
+  GPSSerial.setRxBufferSize(512);
+  GPSSerial.begin(preferred, SERIAL_8N1, rxPin, txPin);
+  return preferred;
 }
 
 // ---------------- Config (plain text key=value) ----------------
@@ -362,7 +465,26 @@ static void cfgAssignKV(const String& k, const String& v) {
   else if (k == "homePsk")       cfg.homePsk = v;
   else if (k == "wardriverSsid") cfg.wardriverSsid = v;
   else if (k == "wardriverPsk")  cfg.wardriverPsk = v;
-  else if (k == "gpsBaud") { uint32_t b = (uint32_t)v.toInt(); if (b > 0) cfg.gpsBaud = b; }
+  else if (k == "gpsBaud") {
+    uint32_t b = (uint32_t)v.toInt();
+    switch (b) {
+      case 4800: case 9600: case 19200: case 38400: case 57600: case 115200:
+        cfg.gpsBaud = b; break;
+      default:
+        Serial.printf("[CFG] WARN: gpsBaud=%lu rejected (not in {4800,9600,19200,38400,57600,115200})\n",
+                      (unsigned long)b);
+    }
+  }
+  else if (k == "gpsAutodetect") {
+    String vv = v; vv.toLowerCase();
+    cfg.gpsAutodetect = (vv == "true" || vv == "1" || vv == "yes" || vv == "on");
+  }
+  else if (k == "gpsFixAgeMaxMs") {
+    uint32_t n = (uint32_t)v.toInt();
+    if (n >= 1000 && n <= 600000) cfg.gpsFixAgeMaxMs = n;
+    else Serial.printf("[CFG] WARN: gpsFixAgeMaxMs=%lu out of range (1000..600000)\n",
+                       (unsigned long)n);
+  }
   else if (k == "scanMode") { if (v == "aggressive" || v == "powersaving") cfg.scanMode = v; }
   else if (k == "speedUnits") { String vv = v; vv.toLowerCase(); if (vv == "kmh" || vv == "mph") cfg.speedUnits = vv; }
   else if (k == "wdgwarsApiKey")   cfg.wdgwarsApiKey = v;
@@ -385,7 +507,12 @@ static bool saveConfigToSD() {
   f.print("homePsk=");         f.println(cfg.homePsk);
   f.print("wardriverSsid=");   f.println(cfg.wardriverSsid);
   f.print("wardriverPsk=");    f.println(cfg.wardriverPsk);
+  f.println("# GPS UART baud (allowed: 4800, 9600, 19200, 38400, 57600, 115200)");
   f.print("gpsBaud=");         f.println(cfg.gpsBaud);
+  f.println("# Try common bauds at boot if the configured one isn't producing NMEA.");
+  f.print("gpsAutodetect=");   f.println(cfg.gpsAutodetect ? "true" : "false");
+  f.println("# Max age (ms) of GPS time before falling back to system clock for CSV rows.");
+  f.print("gpsFixAgeMaxMs=");  f.println(cfg.gpsFixAgeMaxMs);
   f.print("scanMode=");        f.println(cfg.scanMode);
   f.print("speedUnits=");      f.println(cfg.speedUnits);
   f.print("wdgwarsApiKey=");   f.println(cfg.wdgwarsApiKey);
@@ -471,16 +598,70 @@ static String newCsvFilename() {
   return String(buf2);
 }
 
-static void closeLogFile() {
-  if (logFile) {
-    digitalWrite(PINS.tft_cs, HIGH);
-    logFile.flush();
-    logFile.close();
+static void updateSdSpaceInfo() {
+  if (!sdOk) {
+    sdFreeBytes = 0; sdTotalBytes = 0;
+    sdLowSpace  = false; sdCritical = false;
+    return;
   }
+  // Park TFT CS so the shared SPI bus is free for the SD library.
+  digitalWrite(PINS.tft_cs, HIGH);
+  uint64_t total = SD.totalBytes();
+  uint64_t used  = SD.usedBytes();
+  uint64_t freeB = (total > used) ? (total - used) : 0;
+  sdTotalBytes = total;
+  sdFreeBytes  = freeB;
+  sdLowSpace   = (freeB <  SD_LOW_SPACE_BYTES);
+  sdCritical   = (freeB <  SD_CRITICAL_BYTES);
+  Serial.printf("[SD] Space: free=%llu MB / total=%llu MB%s%s\n",
+                (unsigned long long)(freeB / (1024ULL * 1024ULL)),
+                (unsigned long long)(total / (1024ULL * 1024ULL)),
+                sdLowSpace ? "  [LOW]"      : "",
+                sdCritical ? "  [CRITICAL]" : "");
+}
+
+// closeLogFile returns true if the file was flushed AND a post-close stat
+// confirms the file exists with non-zero size on the card.
+static bool closeLogFile() {
+  if (!logFile) return true;
+  digitalWrite(PINS.tft_cs, HIGH);
+  logFile.flush();
+  logFile.close();
+  if (currentCsvPath.length() == 0) return false;
+  digitalWrite(PINS.tft_cs, HIGH);
+  if (!SD.exists(currentCsvPath)) {
+    Serial.printf("[SD] WARN: post-close stat: %s does not exist\n", currentCsvPath.c_str());
+    return false;
+  }
+  digitalWrite(PINS.tft_cs, HIGH);
+  File f = SD.open(currentCsvPath, FILE_READ);
+  if (!f) {
+    Serial.printf("[SD] WARN: post-close re-open failed: %s\n", currentCsvPath.c_str());
+    return false;
+  }
+  size_t sz = f.size();
+  f.close();
+  if (sz == 0) {
+    Serial.printf("[SD] WARN: post-close size==0: %s\n", currentCsvPath.c_str());
+    return false;
+  }
+  return true;
 }
 
 static bool openLogFile() {
   if (!sdOk) return false;
+
+  // Refuse to open a fresh log if the card is critically full — continuing
+  // would either fail-open with no rows or risk corrupting an existing file.
+  updateSdSpaceInfo();
+  if (sdCritical) {
+    Serial.printf("[SD] REFUSING new log: only %llu KB free (< %llu KB critical)\n",
+                  (unsigned long long)(sdFreeBytes / 1024ULL),
+                  (unsigned long long)(SD_CRITICAL_BYTES / 1024ULL));
+    currentCsvPath = "";
+    return false;
+  }
+
   closeLogFile();
   currentCsvPath = newCsvFilename();
   Serial.print("[SD] Opening log: "); Serial.println(currentCsvPath);
@@ -505,6 +686,9 @@ static void appendWigleRow(const String& mac, const String& ssid, const String& 
                            const String& firstSeen, int channel, int rssi,
                            double lat, double lon, double altM, double accM) {
   if (!sdOk || !logFile) return;
+  // Stop writing once the card crosses the critical threshold; further
+  // writes risk corrupting the file when clusters run out mid-row.
+  if (sdCritical) return;
 
   String safeSsid = ssid;
   safeSsid.replace("\"", "\"\"");
@@ -524,17 +708,61 @@ static void appendWigleRow(const String& mac, const String& ssid, const String& 
   line += "WIFI";
 
   digitalWrite(PINS.tft_cs, HIGH);
-  logFile.println(line);
+  // File::println returns 0 when the underlying write fails. Three in a
+  // row means the card is gone — stop logging and flag sdOk=false so the
+  // status row flips to FAIL.
+  static uint8_t consecutiveWriteFails = 0;
+  size_t wrote = logFile.println(line);
+  if (wrote == 0) {
+    consecutiveWriteFails++;
+    Serial.printf("[SD] write FAIL (%u consecutive)\n", consecutiveWriteFails);
+    if (consecutiveWriteFails >= 3) {
+      Serial.println("[SD] giving up: marking SD bad, closing log");
+      logFile.close();
+      sdOk = false;
+      return;
+    }
+  } else {
+    consecutiveWriteFails = 0;
+  }
 
-  static uint32_t lastFlushMs = 0;
-  static uint32_t linesSinceFlush = 0;
+  // Adaptive flush batching: drop to 10 lines after a slow flush, recover
+  // to 25 once the card is keeping up again.
+  static uint32_t lastFlushMs       = 0;
+  static uint32_t linesSinceFlush   = 0;
+  static uint32_t flushBatchLines   = 25;
+  static uint32_t rowsSinceSpaceCheck = 0;
   linesSinceFlush++;
+  rowsSinceSpaceCheck++;
 
-  if (linesSinceFlush >= 25 || (millis() - lastFlushMs) >= 2000) {
+  if (linesSinceFlush >= flushBatchLines || (millis() - lastFlushMs) >= 2000) {
     digitalWrite(PINS.tft_cs, HIGH);
+    uint32_t t0 = millis();
     logFile.flush();
+    uint32_t flushDur = millis() - t0;
     lastFlushMs = millis();
     linesSinceFlush = 0;
+    if (flushDur > 500) {
+      if (flushBatchLines > 10) flushBatchLines = 10;
+      Serial.printf("[SD] slow flush %u ms — batch -> %u\n",
+                    (unsigned)flushDur, (unsigned)flushBatchLines);
+    } else if (flushDur < 50 && flushBatchLines < 25) {
+      flushBatchLines = 25;
+    }
+  }
+
+  // Periodic free-space recheck. ~200 rows is roughly every minute or two
+  // on a typical drive — cheap relative to a Wi-Fi scan.
+  if (rowsSinceSpaceCheck >= 200) {
+    rowsSinceSpaceCheck = 0;
+    updateSdSpaceInfo();
+    if (sdCritical) {
+      Serial.println("[SD] CRITICAL space reached mid-log — flushing & closing");
+      digitalWrite(PINS.tft_cs, HIGH);
+      logFile.flush();
+      logFile.close();
+      // Leave sdOk=true so WebUI/upload still works; just stop appending.
+    }
   }
 }
 
@@ -1121,8 +1349,12 @@ static void updateTFT(float speedValue) {
     // Scan dot
     uint16_t scanCol = allowScan ? COLOR_GREEN : COLOR_YELLOW;
     tft.fillCircle(startX, dotY, dotR, scanCol);
-    // SD dot
-    uint16_t sdCol = sdOk ? COLOR_GREEN : COLOR_RED;
+    // SD dot — green=OK, yellow=LOW (>=5MB free), red=FULL or FAIL
+    uint16_t sdCol;
+    if (!sdOk)           sdCol = COLOR_RED;
+    else if (sdCritical) sdCol = COLOR_RED;
+    else if (sdLowSpace) sdCol = COLOR_YELLOW;
+    else                 sdCol = COLOR_GREEN;
     tft.fillCircle(startX + gap, dotY, dotR, sdCol);
     // GPS dot
     uint16_t gpsCol = gpsHasFix ? COLOR_GREEN : COLOR_YELLOW;
@@ -2225,8 +2457,16 @@ static void handleStatus() {
   bool allowScan = scanningEnabled && sdOk && (userScanOverride || !autoPaused);
   doc["scanningEnabled"] = scanningEnabled;
   doc["allowScan"] = allowScan;
-  doc["sdOk"] = sdOk;
+  doc["sdOk"]       = sdOk;
+  doc["sdLow"]      = sdLowSpace;
+  doc["sdFull"]     = sdCritical;
+  doc["sdFreeMB"]   = (uint32_t)(sdFreeBytes  / (1024ULL * 1024ULL));
+  doc["sdTotalMB"]  = (uint32_t)(sdTotalBytes / (1024ULL * 1024ULL));
   doc["gpsFix"] = gpsHasFix;
+  // Source of the most recent CSV-row timestamp + running fallback count.
+  // 0=GPS (good), 1=SYSTEM (drift possible), 2=PLACEHOLDER (1970)
+  doc["gpsTimeSource"]    = gpsTimeSource;
+  doc["gpsTimeFallbacks"] = gpsTimeFallbackCount;
   doc["found2g"] = networksFound2G;
   doc["found5g"] = networksFound5G;
   doc["wifiConnected"] = (WiFi.status() == WL_CONNECTED);
@@ -2965,6 +3205,17 @@ void setup() {
   GPSSerial.setRxBufferSize(512);
   GPSSerial.begin(cfg.gpsBaud, SERIAL_8N1, PINS.gps_rx, PINS.gps_tx);
 
+  // If autodetect is enabled and the configured baud isn't producing NMEA,
+  // try common rates. Detected baud overrides cfg.gpsBaud for this session
+  // only; we never write it back to /wardriver.cfg automatically.
+  if (cfg.gpsAutodetect) {
+    uint32_t detected = gpsAutodetectBaud(cfg.gpsBaud, PINS.gps_rx, PINS.gps_tx);
+    if (detected != cfg.gpsBaud) {
+      Serial.printf("[GPS] Using detected baud %lu (cfg.gpsBaud=%lu unchanged on disk)\n",
+                    (unsigned long)detected, (unsigned long)cfg.gpsBaud);
+    }
+  }
+
   // WiFi
   WiFi.mode(WIFI_STA);
   bool staOk = connectSTA(12000);
@@ -2991,6 +3242,10 @@ void setup() {
   } else {
     Serial.print("[WEB] AP IP: "); Serial.println(WiFi.softAPIP());
   }
+
+  // Prime SD space info so the first TFT frame shows accurate state
+  // (later refreshed periodically from inside appendWigleRow).
+  if (sdOk) updateSdSpaceInfo();
 
   // Purge header-only CSVs before scanning or uploading
   if (sdOk) {

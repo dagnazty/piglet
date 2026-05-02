@@ -92,7 +92,27 @@ void cfgAssignKV(const String& k, const String& v) {
   else if (k == "wardriverPsk")  cfg.wardriverPsk = v;
   else if (k == "gpsBaud") {
     uint32_t b = (uint32_t)v.toInt();
-    if (b > 0) cfg.gpsBaud = b;
+    // Whitelist standard NMEA bauds. Anything else silently rejected so a
+    // typo in the config can't kill the GPS UART until someone notices.
+    switch (b) {
+      case 4800: case 9600: case 19200: case 38400: case 57600: case 115200:
+        cfg.gpsBaud = b;
+        break;
+      default:
+        Serial.printf("[CFG] WARN: gpsBaud=%lu rejected (not in {4800,9600,19200,38400,57600,115200})\n",
+                      (unsigned long)b);
+        break;
+    }
+  }
+  else if (k == "gpsAutodetect") {
+    String vv = v; vv.toLowerCase();
+    cfg.gpsAutodetect = (vv == "true" || vv == "1" || vv == "yes" || vv == "on");
+  }
+  else if (k == "gpsFixAgeMaxMs") {
+    uint32_t n = (uint32_t)v.toInt();
+    if (n >= 1000 && n <= 600000) cfg.gpsFixAgeMaxMs = n;
+    else Serial.printf("[CFG] WARN: gpsFixAgeMaxMs=%lu out of range (1000..600000)\n",
+                       (unsigned long)n);
   }
   else if (k == "scanMode") {
     if (v == "aggressive" || v == "powersaving") cfg.scanMode = v;
@@ -238,8 +258,12 @@ bool saveConfigToSD() {
   f.print("wardriverPsk=");    f.println(cfg.wardriverPsk);
   f.println("");
 
-  f.println("# GPS UART baud rate (default: 9600)");
+  f.println("# GPS UART baud rate (allowed: 4800, 9600, 19200, 38400, 57600, 115200)");
   f.print("gpsBaud=");         f.println(cfg.gpsBaud);
+  f.println("# Try common bauds at boot if the configured one isn't producing NMEA.");
+  f.print("gpsAutodetect=");   f.println(cfg.gpsAutodetect ? "true" : "false");
+  f.println("# Max age (ms) of GPS time before falling back to system clock for CSV rows.");
+  f.print("gpsFixAgeMaxMs=");  f.println(cfg.gpsFixAgeMaxMs);
   f.println("");
 
   f.println("# Scan interval: aggressive (4.5s) or powersaving (12s)");

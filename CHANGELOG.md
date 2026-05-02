@@ -1,5 +1,51 @@
 # Changelog
 
+## v2.4 (2026-05-02)
+
+Reliability pass focused on **never silently losing data** and **never silently
+lying about timestamps**. All three variants (XIAO Piglet, T-Dongle C5, Waveshare
+Mini) ported in lockstep.
+
+### SD reliability (Tier 1)
+- **Free-space accounting**: tracks free/total bytes; OLED & WebUI now show
+  `OK / LOW / FULL / FAIL` instead of just `OK / FAIL`. Defaults: LOW < 50 MB,
+  CRITICAL < 5 MB.
+- **Refuse to open new logs when CRITICAL** so a near-full card can't corrupt
+  an existing file when clusters run out mid-row.
+- **Mid-drive recheck** every ~200 rows; if it crosses CRITICAL the active
+  log is flushed and closed cleanly (uploads/WebUI keep working).
+- **Write-failure detection**: 3 consecutive `println()` failures marks SD
+  bad and trips `FAIL` on the display so a yanked or stuck card is obvious.
+- **Adaptive flush batching**: drops 25→10 lines after a slow flush (>500 ms)
+  and recovers when the card catches up.
+- **Verified close before deep sleep** (XIAO): post-close stat confirms the
+  file exists with non-zero size; otherwise the OLED shows
+  `SD WARN — Last write may not have saved` for 2 s before powering off.
+
+### GPS / time correctness (Tier 2)
+- **`gpsFixAgeMaxMs` is now configurable** (range 1000..600000). Default
+  unchanged per board (XIAO 15 s, T-Dongle/Waveshare 5 s).
+- **Time-source tracking**: every CSV row now records which clock produced
+  its timestamp — `GPS` (good), `SYSTEM` (drift possible), or `PLACEHOLDER`
+  (1970 fallback). Logged once per transition (`[TIME] source -> SYSTEM`).
+- **Visible in WebUI**: GPS pill now shows `LOCK (sys time)` in amber or
+  `NO FIX (no time!)` in red when rows aren't using fresh GPS time. Fallback
+  counter exposed in `/status.json`.
+- **GPS baud autodetect** (`gpsAutodetect=true` by default): probes
+  9600/38400/115200/4800/19200/57600 if the configured baud isn't producing
+  NMEA. Detected baud overrides for the session only — never written back to
+  `/wardriver.cfg`, so a transient GPS issue can't quietly edit user config.
+- **`gpsBaud` whitelist**: typos like `gpsBaud=9650` now log a warning
+  instead of silently bricking the GPS UART.
+
+### Notes
+- All new config keys ship with sane defaults; **existing `/wardriver.cfg`
+  files keep working unchanged**.
+- Detected GPS baud is intentionally **not** persisted — set `gpsBaud`
+  explicitly if you want to skip the ~1.5 s autodetect probe at boot.
+
+---
+
 ## v1.3-beta (2026-02-23)
 
 ### New Features

@@ -124,6 +124,32 @@ bool moveToUploaded(const String& srcPath) {
   return true;
 }
 
+// ---- SD space accounting ----
+
+void updateSdSpaceInfo() {
+  if (!sdOk) {
+    sdFreeBytes  = 0;
+    sdTotalBytes = 0;
+    sdLowSpace   = false;
+    sdCritical   = false;
+    return;
+  }
+  uint64_t total = SD.totalBytes();
+  uint64_t used  = SD.usedBytes();
+  uint64_t freeB = (total > used) ? (total - used) : 0;
+
+  sdTotalBytes = total;
+  sdFreeBytes  = freeB;
+  sdLowSpace   = (freeB <  SD_LOW_SPACE_BYTES);
+  sdCritical   = (freeB <  SD_CRITICAL_BYTES);
+
+  Serial.printf("[SD] Space: free=%llu MB / total=%llu MB%s%s\n",
+                (unsigned long long)(freeB / (1024ULL * 1024ULL)),
+                (unsigned long long)(total / (1024ULL * 1024ULL)),
+                sdLowSpace ? "  [LOW]"      : "",
+                sdCritical ? "  [CRITICAL]" : "");
+}
+
 // ---- Log file ----
 
 // Sanitise a user-provided device name for safe use in filenames.
@@ -170,6 +196,18 @@ static String newCsvFilename() {
 bool openLogFile() {
   if (!sdOk) return false;
 
+  // Refresh space info so we can refuse to open if the card is full —
+  // continuing would either fail-open with no rows or, worse, corrupt
+  // an existing file when the FS runs out of clusters.
+  updateSdSpaceInfo();
+  if (sdCritical) {
+    Serial.printf("[SD] REFUSING to open new log: only %llu KB free (< %llu KB critical)\n",
+                  (unsigned long long)(sdFreeBytes / 1024ULL),
+                  (unsigned long long)(SD_CRITICAL_BYTES / 1024ULL));
+    currentCsvPath = "";
+    return false;
+  }
+
   // Close any previous handle
   closeLogFile();
 
@@ -200,18 +238,45 @@ bool openLogFile() {
   return true;
 }
 
-void closeLogFile() {
-  if (logFile) {
-    Serial.println("[SD] Closing log file");
-    logFile.flush();
-    logFile.close();
+bool closeLogFile() {
+  if (!logFile) return true;  // nothing to close, treat as fine
+
+  Serial.println("[SD] Closing log file");
+  logFile.flush();
+  logFile.close();
+
+  // Post-close verification: if the path doesn't exist or is zero bytes,
+  // the card likely dropped the buffer (stuck/corrupt SD, or it was yanked).
+  // We don't try to recover here — the caller (e.g. enterDeepSleep) decides
+  // how to surface this.
+  if (currentCsvPath.length() == 0) return false;
+  if (!SD.exists(currentCsvPath)) {
+    Serial.printf("[SD] WARN: post-close stat: %s does not exist\n", currentCsvPath.c_str());
+    return false;
   }
+  File f = SD.open(currentCsvPath, FILE_READ);
+  if (!f) {
+    Serial.printf("[SD] WARN: post-close re-open failed: %s\n", currentCsvPath.c_str());
+    return false;
+  }
+  size_t sz = f.size();
+  f.close();
+  if (sz == 0) {
+    Serial.printf("[SD] WARN: post-close size==0: %s\n", currentCsvPath.c_str());
+    return false;
+  }
+  Serial.printf("[SD] Close verified: %s (%u bytes)\n", currentCsvPath.c_str(), (unsigned)sz);
+  return true;
 }
 
 void appendWigleRow(const String& mac, const String& ssid, const String& auth,
                     const String& firstSeen, int channel, int rssi,
                     double lat, double lon, double altM, double accM) {
   if (!sdOk || !logFile) return;
+
+  // If a previous space recheck tripped CRITICAL, stop writing rather than
+  // letting the FS run out of clusters mid-row (which can corrupt the file).
+  if (sdCritical) return;
 
   String safeSsid = ssid;
   safeSsid.replace("\"", "\"\"");
@@ -230,18 +295,63 @@ void appendWigleRow(const String& mac, const String& ssid, const String& auth,
   line += String(accM, 1); line += ",";
   line += "WIFI";
 
-  logFile.println(line);
+  // Detect write failures: File::println returns 0 on a failed write.
+  // Three in a row means the card is gone — mark sdOk=false so future
+  // calls bail fast and the OLED can show "FAIL".
+  static uint8_t consecutiveWriteFails = 0;
+  size_t wrote = logFile.println(line);
+  if (wrote == 0) {
+    consecutiveWriteFails++;
+    Serial.printf("[SD] write FAIL (%u consecutive)\n", consecutiveWriteFails);
+    if (consecutiveWriteFails >= 3) {
+      Serial.println("[SD] giving up: marking SD bad, closing log");
+      logFile.close();
+      sdOk = false;
+      return;
+    }
+  } else {
+    consecutiveWriteFails = 0;
+  }
 
-  // Flush less often to avoid stalls (SD writes can block hard)
-  static uint32_t lastFlushMs = 0;
+  // Flush less often to avoid stalls (SD writes can block hard).
+  // Adapt: if a previous flush ran long, drop the line-batch to flush
+  // sooner and keep total stall time per call lower.
+  static uint32_t lastFlushMs    = 0;
   static uint32_t linesSinceFlush = 0;
+  static uint32_t flushBatchLines = 25;  // adaptive: 10..25
+  static uint32_t rowsSinceSpaceCheck = 0;
 
   linesSinceFlush++;
+  rowsSinceSpaceCheck++;
 
   uint32_t nowMs = millis();
-  if (linesSinceFlush >= 25 || (nowMs - lastFlushMs) >= 2000) {
+  if (linesSinceFlush >= flushBatchLines || (nowMs - lastFlushMs) >= 2000) {
+    uint32_t t0 = millis();
     logFile.flush();
-    lastFlushMs = nowMs;
+    uint32_t flushDur = millis() - t0;
+    lastFlushMs     = nowMs;
     linesSinceFlush = 0;
+
+    if (flushDur > 500) {
+      // SD is being slow — shorten the batch so we hit fewer rows per stall.
+      if (flushBatchLines > 10) flushBatchLines = 10;
+      Serial.printf("[SD] slow flush %u ms — batch -> %u\n",
+                    (unsigned)flushDur, (unsigned)flushBatchLines);
+    } else if (flushDur < 50 && flushBatchLines < 25) {
+      flushBatchLines = 25;
+    }
+  }
+
+  // Periodic space recheck. Cheap relative to a full scan, but not free.
+  // Every 200 rows is roughly every minute or two on a typical drive.
+  if (rowsSinceSpaceCheck >= 200) {
+    rowsSinceSpaceCheck = 0;
+    updateSdSpaceInfo();
+    if (sdCritical) {
+      Serial.println("[SD] CRITICAL space reached mid-log — flushing & closing");
+      logFile.flush();
+      logFile.close();
+      // Leave sdOk=true so the WebUI/upload still works; just stop appending.
+    }
   }
 }

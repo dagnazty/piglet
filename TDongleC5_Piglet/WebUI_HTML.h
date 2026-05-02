@@ -52,7 +52,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 </style>
 </head>
 <body>
-  <div class="header"><div class="logo">&#x1f437;</div><div><h1>Piglet Wardriver</h1><p class="sub">T-Dongle C5 &mdash; ESP32-C5 Dual-Band &mdash; v2.3</p></div></div>
+  <div class="header"><div class="logo">&#x1f437;</div><div><h1>Piglet Wardriver</h1><p class="sub">T-Dongle C5 &mdash; ESP32-C5 Dual-Band &mdash; v2.4</p></div></div>
 
   <div class="card">
     <h3>Status</h3>
@@ -160,8 +160,21 @@ function setWdgwarsMsg(t,cls){const el=$('wdgwarsMsg');el.textContent=t;el.class
 async function loadStatus(){try{
   const r=await fetch('/status.json');const j=await r.json();
   setPill('pillScan','Scan: '+(j.allowScan?'ACTIVE':'PAUSED'),j.allowScan?'ok':'warn');
-  setPill('pillSd','SD: '+(j.sdOk?'OK':'FAIL'),j.sdOk?'ok':'bad');
-  setPill('pillGps','GPS: '+(j.gpsFix?'LOCK':'NO FIX'),j.gpsFix?'ok':'warn');
+  {
+    let sdLabel='SD: '+(j.sdOk?(j.sdFull?'FULL':(j.sdLow?'LOW':'OK')):'FAIL');
+    if(j.sdOk && (j.sdLow||j.sdFull) && typeof j.sdFreeMB!=='undefined') sdLabel += ' ('+j.sdFreeMB+' MB)';
+    let sdCls = !j.sdOk?'bad':(j.sdFull?'bad':(j.sdLow?'warn':'ok'));
+    setPill('pillSd', sdLabel, sdCls);
+  }
+  {
+    let lab='GPS: '+(j.gpsFix?'LOCK':'NO FIX');
+    let cls=j.gpsFix?'ok':'warn';
+    if(typeof j.gpsTimeSource!=='undefined'){
+      if(j.gpsTimeSource===1){lab+=' (sys time)';cls='warn'}
+      else if(j.gpsTimeSource===2){lab+=' (no time!)';cls='bad'}
+    }
+    setPill('pillGps',lab,cls);
+  }
   setPill('pillSta','STA: '+(j.wifiConnected?'ON':'OFF'),j.wifiConnected?'ok':'warn');
   const wC=(j.wigleTokenStatus===1)?'ok':(j.wigleTokenStatus===-1?'bad':'warn');
   setPill('pillWigle','WiGLE: '+(j.wigleTokenStatus===1?'Valid':j.wigleTokenStatus===-1?'Invalid':'Unknown'),wC);

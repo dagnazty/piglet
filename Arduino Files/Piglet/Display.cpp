@@ -360,7 +360,10 @@ static void drawPageStatus(float speedValue) {
     display.print("STA: ");
     display.print(WiFi.status() == WL_CONNECTED ? "YES" : "NO");
     display.print("  SD: ");
-    display.print(sdOk ? "OK" : "FAIL");
+    if (!sdOk)            display.print("FAIL");
+    else if (sdCritical)  display.print("FULL");
+    else if (sdLowSpace)  display.print("LOW");
+    else                  display.print("OK");
 
     display.display();
     return;
@@ -408,10 +411,14 @@ static void drawPageStatus(float speedValue) {
   display.print(speedValue, 1);
   display.print(cfg.speedUnits == "mph" ? " mph" : " km/h");
 
-  // SD (always at same place)
+  // SD (always at same place). Surface low/critical state so the user
+  // sees "FULL" before the card actually runs out of clusters mid-drive.
   display.setCursor(0, yLineSD);
   display.print("SD: ");
-  display.print(sdOk ? "OK" : "FAIL");
+  if (!sdOk)            display.print("FAIL");
+  else if (sdCritical)  display.print("FULL");
+  else if (sdLowSpace)  display.print("LOW");
+  else                  display.print("OK");
 
   // Bottom row: IP / AP countdown / Compass (ALWAYS SAME Y)
   display.setCursor(0, yBottom);

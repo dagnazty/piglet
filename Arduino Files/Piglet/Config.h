@@ -9,6 +9,14 @@ struct Config {
   String wardriverSsid = "Piglet-WARDRIVE";
   String wardriverPsk  = "wardrive1234";
   uint32_t gpsBaud     = 9600;
+  // Try common NMEA baud rates at boot if the configured baud isn't producing
+  // valid sentences within ~1.5 s. Detected baud overrides cfg.gpsBaud for the
+  // session but is NOT persisted (avoids surprise edits to /wardriver.cfg).
+  bool     gpsAutodetect = true;
+  // Max age (ms) of GPS date+time before iso8601NowUTC() falls back to system
+  // clock. 15s is a good balance for moving vehicles; lower (e.g. 5000) is
+  // stricter and useful if you suspect stale fixes.
+  uint32_t gpsFixAgeMaxMs = 15000;
   String scanMode      = "aggressive"; // aggressive | powersaving
   String board = "auto"; // auto | s3 | c5 | c6 | exp  (pins selected at boot; reboot required after change)
   String speedUnits  = "kmh"; // kmh | mph

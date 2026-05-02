@@ -255,7 +255,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     <div class="logo">&#x1f437;</div>
     <div>
       <h1>Piglet Wardriver</h1>
-      <p class="sub">ESP32 Wi-Fi Scanner &amp; Logger &mdash; v2.3</p>
+      <p class="sub">ESP32 Wi-Fi Scanner &amp; Logger &mdash; v2.4</p>
     </div>
   </div>
 
@@ -470,8 +470,24 @@ async function loadStatus(){
     const j=await r.json();
 
     setPill('pillScan','Scan: '+(j.allowScan?'ACTIVE':'PAUSED'),j.allowScan?'ok':'warn');
-    setPill('pillSd','SD: '+(j.sdOk?'OK':'FAIL'),j.sdOk?'ok':'bad');
-    setPill('pillGps','GPS: '+(j.gpsFix?'LOCK':'NO FIX'),j.gpsFix?'ok':'warn');
+    {
+      let sdLabel='SD: '+(j.sdOk?(j.sdFull?'FULL':(j.sdLow?'LOW':'OK')):'FAIL');
+      if(j.sdOk && (j.sdLow||j.sdFull) && typeof j.sdFreeMB!=='undefined') sdLabel += ' ('+j.sdFreeMB+' MB)';
+      const sdCls=!j.sdOk?'bad':(j.sdFull?'bad':(j.sdLow?'warn':'ok'));
+      setPill('pillSd',sdLabel,sdCls);
+    }
+    {
+      // Decorate GPS pill with the time-source the CSV is currently stamping
+      // with, since "LOCK" alone hides the case where rows are using SYSTEM
+      // time (drift) or 1970-placeholder timestamps.
+      let lab = 'GPS: ' + (j.gpsFix ? 'LOCK' : 'NO FIX');
+      let cls = j.gpsFix ? 'ok' : 'warn';
+      if (typeof j.gpsTimeSource !== 'undefined') {
+        if (j.gpsTimeSource === 1) { lab += ' (sys time)';   cls = 'warn'; }
+        else if (j.gpsTimeSource === 2) { lab += ' (no time!)'; cls = 'bad'; }
+      }
+      setPill('pillGps', lab, cls);
+    }
     setPill('pillSta','STA: '+(j.wifiConnected?'CONNECTED':'OFF'),j.wifiConnected?'ok':'warn');
 
     const wCls=(j.wigleTokenStatus===1)?'ok':(j.wigleTokenStatus===-1?'bad':'warn');
@@ -785,8 +801,16 @@ static void handleStatus() {
   doc["allowScan"] = allowScan;
   doc["userScanOverride"] = userScanOverride;
   doc["autoPaused"] = autoPaused;
-  doc["sdOk"] = sdOk;
+  doc["sdOk"]      = sdOk;
+  doc["sdLow"]     = sdLowSpace;
+  doc["sdFull"]    = sdCritical;
+  doc["sdFreeMB"]  = (uint32_t)(sdFreeBytes  / (1024ULL * 1024ULL));
+  doc["sdTotalMB"] = (uint32_t)(sdTotalBytes / (1024ULL * 1024ULL));
   doc["gpsFix"] = gpsHasFix;
+  // Source of the most recent CSV-row timestamp, plus running fallback count.
+  // gpsTimeSource: 0=GPS (good), 1=SYSTEM (drift possible), 2=PLACEHOLDER (1970)
+  doc["gpsTimeSource"]    = gpsTimeSource;
+  doc["gpsTimeFallbacks"] = gpsTimeFallbackCount;
   doc["found2g"] = networksFound2G;
   doc["found5g"] = wardriverIsC5() ? networksFound5G : 0;
   doc["c5Connected"] = wardriverIsC5();

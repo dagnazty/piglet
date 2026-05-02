@@ -17,6 +17,16 @@ bool allowScanForOled = false;
 bool userScanOverride = false;
 bool autoPaused = false;
 
+// ---- GPS time-source tracking ----
+uint8_t  gpsTimeSource         = 2;  // start as PLACEHOLDER until first row produced
+uint32_t gpsTimeFallbackCount  = 0;
+
+// ---- SD space accounting ----
+uint64_t sdFreeBytes  = 0;
+uint64_t sdTotalBytes = 0;
+bool     sdLowSpace   = false;
+bool     sdCritical   = false;
+
 // ---- OLED page system ----
 uint8_t currentPage = 0;
 bool statusPagePaused = false;
